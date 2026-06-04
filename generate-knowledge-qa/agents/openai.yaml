@@ -1,0 +1,4 @@
+interface:
+  display_name: "Generate Knowledge QA"
+  short_description: "Create QA groundtruth from atomic knowledge."
+  default_prompt: "Generate question and groundtruth_knowledge_ids pairs from an atomic knowledge JSON file."
