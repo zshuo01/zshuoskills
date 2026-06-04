@@ -6,7 +6,7 @@
 
 | 技能名称 (Skill Name) | 一句话讲解 (Description) | 调用示例 (Usage Examples) |
 | :--- | :--- | :--- |
-| **generate-knowledge-qa** | 从原子知识 JSON/JSONL 数据中，通过本地主题聚类、大模型改写合并等步骤，自动生成符合 GraphRAG 本地查询格式的评估数据集。 | **1. 生成候选评估数据骨架**:<br>`python generate-knowledge-qa/scripts/generate_qa_groundtruth.py 原子知识.json -o qa_candidates.json --count 30`<br><br>**2. 导出 LLM 改写 prompts**:<br>`python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --export-prompts -o rewrite_prompts.jsonl`<br><br>**3. 合并改写结果**:<br>`python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --merge rewritten_results.jsonl -o graphrag_local_eval_final.json`<br><br>**4. 校验数据集格式**:<br>`python generate-knowledge-qa/scripts/validate_qa_dataset.py graphrag_local_eval_final.json` |
+| **generate-knowledge-qa** | 从原子知识 JSON/JSONL 数据中，通过本地主题聚类、大模型改写合并等步骤，自动生成符合 GraphRAG 本地查询格式的评估数据集。 | 根据 `input.json` 知识库文件，生成 30 个评估问题：<br>`python generate-knowledge-qa/scripts/generate_qa_groundtruth.py input.json -o output.json --count 30` |
 
 ## 如何使用本仓库
 
