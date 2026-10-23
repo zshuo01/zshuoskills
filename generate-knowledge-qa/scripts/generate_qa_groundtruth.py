@@ -2,7 +2,7 @@
 """Generate GraphRAG local-query evaluation candidates from atomic knowledge.
 
 The script is deliberately model-free by default. It fixes a 3-10 id local
-topic cluster first, then emits draft wording and enough supporting text for a
+topic cluster first, then emits blank wording fields and supporting text for a
 later rewrite step. The rewrite step must preserve the ids or reject the case.
 """
 
@@ -32,7 +32,7 @@ RELATION_PAIR_KEYS = (
 DEFAULT_MIN_IDS = 3
 DEFAULT_TARGET_IDS = 6
 DEFAULT_MAX_IDS = 10
-DEFAULT_MAX_SUPPORTING_CHARS = 3000
+DEFAULT_MAX_SUPPORTING_CHARS = 0  # Full source text; bounded previews are separate.
 
 TAX_TOPIC_WHITELIST = (
     "增值税",
@@ -181,7 +181,25 @@ def first_value(record: dict[str, Any], keys: Iterable[str]) -> Any:
 
 def record_id(record: dict[str, Any]) -> str | None:
     value = first_value(record, ID_KEYS)
-    return str(value) if value not in (None, "") else None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    return str(value).strip() or None
+
+
+def index_records(raw_records: list[Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    records: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(raw_records, start=1):
+        if not isinstance(row, dict) or not record_id(row):
+            raise SystemExit(f"knowledge record {index}: requires a non-empty knowledge_id/id/kid")
+        kid = record_id(row)
+        if kid in by_id:
+            raise SystemExit(f"knowledge record {index}: duplicate knowledge id {kid}")
+        if not any(normalize_space(value_to_text(row.get(key))) for key in TEXT_KEYS):
+            raise SystemExit(f"knowledge record {index} ({kid}): missing text; expected one of {TEXT_KEYS}")
+        records.append(row)
+        by_id[kid] = row
+    return records, by_id
 
 
 def normalize_space(text: str) -> str:
@@ -203,7 +221,7 @@ def value_to_text(value: Any) -> str:
     return str(value)
 
 
-def normalized_text(record: dict[str, Any], max_chars: int = 3000) -> str:
+def normalized_text(record: dict[str, Any], max_chars: int | None = 3000) -> str:
     """Merge title-like and text-like fields with a bounded total length."""
     parts: list[str] = []
     for key in (*TITLE_KEYS, *TEXT_KEYS):
@@ -211,18 +229,13 @@ def normalized_text(record: dict[str, Any], max_chars: int = 3000) -> str:
             continue
         value = normalize_space(value_to_text(record.get(key)))
         if value:
-            parts.append(value[: max_chars])
-    if not parts:
-        for value in record.values():
-            text = normalize_space(value_to_text(value))
-            if text:
-                parts.append(text[: max_chars])
+            parts.append(value if max_chars is None else value[:max_chars])
     merged = normalize_space(" ".join(dict.fromkeys(parts)))
-    return merged[:max_chars]
+    return merged if max_chars is None else merged[:max_chars]
 
 
 def full_normalized_text(record: dict[str, Any]) -> str:
-    return normalized_text(record, max_chars=200_000)
+    return normalized_text(record, max_chars=None)
 
 
 def preview_text(text: str, limit: int = 180) -> str:
@@ -248,6 +261,11 @@ def char_ngrams(text: str, sizes: Sequence[int] = (2, 3)) -> set[str]:
                 continue
             features.update(run[i : i + size] for i in range(len(run) - size + 1))
     return features
+
+
+def lexical_features(text: str) -> set[str]:
+    tokens = re.findall(r"[A-Za-z]+(?:[-_][A-Za-z0-9]+)*|\d+(?:\.\d+)?[%％‰]?", text)
+    return char_ngrams(text) | {f"token:{token.casefold()}" for token in tokens}
 
 
 def jaccard(left: set[str] | set[Any], right: set[str] | set[Any]) -> float:
@@ -283,12 +301,9 @@ def canonical_topic(topic: str) -> str:
 
 
 def topic_hits(text: str) -> Counter[str]:
-    counts: Counter[str] = Counter()
-    for topic in TAX_TOPIC_WHITELIST:
-        hit_count = text.count(topic)
-        if hit_count:
-            counts[topic] += hit_count
-    return counts
+    # Match the longest tax name first so 土地增值税 is not counted as 增值税.
+    pattern = "|".join(re.escape(topic) for topic in sorted(TAX_TOPIC_WHITELIST, key=lambda topic: (-len(topic), topic)))
+    return Counter(match.group() for match in re.finditer(pattern, text))
 
 
 def cjk_terms(text: str) -> list[str]:
@@ -328,13 +343,13 @@ def infer_main_topic(records: list[dict[str, Any]]) -> str:
 
     term_counts: Counter[str] = Counter()
     for record in records:
-        for term in set(cjk_terms(normalized_text(record, max_chars=1200))):
+        for term in sorted(set(cjk_terms(normalized_text(record, max_chars=1200)))):
             if 2 <= len(term) <= 6 and term not in STOPWORDS:
                 if any(stop in term for stop in STOPWORDS):
                     continue
                 term_counts[term] += 1
     if term_counts:
-        return canonical_topic(term_counts.most_common(1)[0][0])
+        return canonical_topic(min(term_counts, key=lambda term: (-term_counts[term], -len(term), term)))
     return "局部主题"
 
 
@@ -481,7 +496,7 @@ def lexical_neighbor_groups(
         return []
 
     texts = {kid: normalized_text(by_id[kid]) for kid in ids}
-    grams = {kid: char_ngrams(texts[kid]) for kid in ids}
+    grams = {kid: lexical_features(texts[kid]) for kid in ids}
     facets = {kid: set(detect_facets_from_text(texts[kid])) for kid in ids}
     topics = {kid: record_topic(by_id[kid]) for kid in ids}
 
@@ -510,7 +525,7 @@ def pairwise_average(values: list[float]) -> float:
 
 def score_cluster(ids: list[str], by_id: dict[str, dict[str, Any]]) -> dict[str, float]:
     texts = [normalized_text(by_id[kid]) for kid in ids]
-    gram_sets = [char_ngrams(text) for text in texts]
+    gram_sets = [lexical_features(text) for text in texts]
     facet_sets = [set(detect_facets_from_text(text)) for text in texts]
     topics = [record_topic(by_id[kid]) for kid in ids]
 
@@ -556,13 +571,14 @@ def make_supporting_knowledge(
     max_supporting_chars: int,
 ) -> dict[str, Any]:
     full_text = full_normalized_text(record)
-    support_text = full_text[:max_supporting_chars]
+    support_text = full_text[:max_supporting_chars] if max_supporting_chars else full_text
     return {
         "knowledge_id": kid,
         "knowledge_text": support_text,
         "preview_text": preview_text(full_text),
         "detected_facets": detect_facets_from_text(full_text),
         "text_length": len(full_text),
+        "is_truncated": len(support_text) < len(full_text),
     }
 
 
@@ -692,7 +708,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Include supporting_knowledge and quality_checks for rewrite/review; final JSON should omit them.",
     )
     parser.add_argument("--final-only", action="store_true", help="Deprecated compatibility flag; this is now the default.")
-    parser.add_argument("--max-supporting-chars", type=int, default=DEFAULT_MAX_SUPPORTING_CHARS, help="Max chars per supporting knowledge_text.")
+    parser.add_argument("--max-supporting-chars", type=int, default=DEFAULT_MAX_SUPPORTING_CHARS, help="Max chars per supporting text; 0 (default) keeps the full text. Truncated candidates cannot be rewritten.")
     parser.add_argument("--min-coherence", type=float, default=0.12, help="Minimum final_coherence_score for output clusters.")
     parser.add_argument("--overlap-threshold", type=float, default=0.75, help="Jaccard id-overlap threshold for candidate dedupe.")
     parser.add_argument("--max-per-category", type=int, default=2, help="At most N cases per category; 0 disables the cap.")
@@ -707,16 +723,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate_id_args(args.min_ids, args.target_ids, args.max_ids)
     if args.count < 1:
         raise SystemExit("--count must be positive")
-    if args.max_supporting_chars < 500:
-        raise SystemExit("--max-supporting-chars should be at least 500")
+    if args.max_supporting_chars != 0 and args.max_supporting_chars < 500:
+        raise SystemExit("--max-supporting-chars must be 0 (full text) or at least 500")
 
     raw_records = load_json_or_jsonl(args.knowledge_file)
-    records = [row for row in raw_records if isinstance(row, dict) and record_id(row)]
-    by_id = {record_id(row): row for row in records if record_id(row)}
+    records, by_id = index_records(raw_records)
     if len(by_id) < args.min_ids:
         raise SystemExit(f"Need at least {args.min_ids} records with knowledge_id/id/kid")
 
     cases = build_candidates(records, by_id, args)
+    if not cases:
+        raise SystemExit("No candidate clusters met the filters; no empty dataset was written")
     dataset = {
         "dataset_name": args.dataset_name or f"graphrag_local_retrieval_eval_{len(cases)}",
         "source_file": args.source_file or args.knowledge_file.name,

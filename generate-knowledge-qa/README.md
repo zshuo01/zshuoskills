@@ -1,52 +1,60 @@
 # Generate Knowledge QA
 
-Generate GraphRAG local-query evaluation datasets from atomic knowledge JSON/JSONL.
+Generate Chinese financial GraphRAG local-query evaluation cases whose
+questions, answers, and fixed knowledge ids match. See [SKILL.md](SKILL.md) for
+the full contract and workflow.
 
-## Required Output Shape
+The final deliverable remains a `.json` file with exactly:
 
-The user-facing JSON contains only:
+- Top level: `dataset_name`, `source_file`, `design_principles`, `cases`.
+- Each case: `query_id`, `category`, `question`, `groundtruth_knowledge_ids`,
+  `groundtruth_answer`, `design_intent`.
 
-- Top level: `dataset_name`, `source_file`, `design_principles`, `cases`
-- Each case: `query_id`, `category`, `question`, `groundtruth_knowledge_ids`, `groundtruth_answer`, `design_intent`
-
-No `supporting_knowledge`, `quality_checks`, prompts, scores, or other review fields may appear in the final/user-facing JSON.
-
-Do not use the legacy two-field final shape
-`{"question": "...", "groundtruth_knowledge_ids": [...]}`. That shape is
-insufficient for this GraphRAG local-query evaluation skill.
+Review data never enter that file. Each case still uses 3–10 fixed ids and an
+answer of at most three sentences. Graph structure is not an output or review
+requirement.
 
 ## Pipeline
 
-1. Inspect input fields.
-2. Run `generate_qa_groundtruth.py` to generate candidate skeletons in the full dataset object shape. Python fixes ids/materials only; it does not template natural questions.
-3. For rewrite work only, rerun with `--include-review-fields` and export prompts.
-4. Use an LLM to process prompts and produce `rewritten_results.jsonl`.
-5. Run `rewrite_and_merge.py --merge` to build the final dataset.
-6. Run `validate_qa_dataset.py` to validate the final JSON.
-7. Human spot-check the final cases.
-
-## Commands
-
-Compact candidate JSON with no review fields. It keeps the six allowed case fields, but natural wording fields stay blank until LLM rewrite:
+Run these commands from the repository root; for an installed copy, replace
+`generate-knowledge-qa` with that skill folder’s path.
 
 ```bash
-python skills/generate-knowledge-qa/scripts/generate_qa_groundtruth.py 原子知识.json \
-  -o qa_candidates.json --count 30 --min-ids 3 --target-ids 6 --max-ids 10
+python generate-knowledge-qa/scripts/generate_qa_groundtruth.py knowledge.json -o qa_candidates_review.json --count 30 --include-review-fields
+python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --export-prompts -o rewrite_prompts.jsonl
 ```
 
-Rewrite workflow with explicit review fields:
+Process each rewrite prompt with an LLM and save `rewritten_results.jsonl`.
+Successful results include an intermediate `evidence_alignment`: each id’s
+exact quote, question span, answer span, and necessary contribution. Unsuitable
+sets return `reject_reason`. Then export a fresh review pass:
 
 ```bash
-python skills/generate-knowledge-qa/scripts/generate_qa_groundtruth.py 原子知识.json \
-  -o qa_candidates_review.json --count 30 --include-review-fields
-
-python skills/generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json \
-  --export-prompts -o rewrite_prompts.jsonl
-
-python skills/generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json \
-  --merge rewritten_results.jsonl -o graphrag_local_eval_final.json
-
-python skills/generate-knowledge-qa/scripts/validate_qa_dataset.py graphrag_local_eval_final.json
+python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --export-review-prompts rewritten_results.jsonl -o alignment_review_prompts.jsonl
 ```
 
-`groundtruth_knowledge_ids` are fixed before rewrite. The rewrite result must either return `question`, `category`, `design_intent`, and `groundtruth_answer`, or return `reject_reason`. The merged final dataset contains only the six case fields.
+Process these prompts and save `reviewed_results.jsonl`, retaining the supplied
+`query_id` and `input_hash`. A review checks question answerability, answer
+support, each id’s necessity, scope/conditions, and numbers. Then merge:
+
+```bash
+python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --merge rewritten_results.jsonl --reviews reviewed_results.jsonl -o graphrag_local_eval_final.json
+python generate-knowledge-qa/scripts/validate_qa_dataset.py graphrag_local_eval_final.json --knowledge-file knowledge.json
+```
+
+Source texts are complete by default. Missing/truncated supports, changed fixed
+ids, fabricated quotes, unmapped answer text, and missing/duplicate batch
+results are blocked. Direct numbers absent from their citations require an
+explicit calculation derivation and subsequent review. Invalid rewrites and
+rejected reviews are reported separately; a failed or empty final dataset is
+not written. If an output already exists, failure leaves it untouched; use a
+new output path for a new run to avoid confusing it with an earlier dataset.
+
+These checks establish traceability; semantic correctness still depends on the
+actual review and a human spot-check. They do not claim to prove entailment.
+
+Run the regression tests with:
+
+```bash
+python -B -m unittest discover -s generate-knowledge-qa/tests -v
+```

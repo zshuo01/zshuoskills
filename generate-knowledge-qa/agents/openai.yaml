@@ -1,4 +1,4 @@
 interface:
   display_name: "Generate Knowledge QA"
-  short_description: "Create QA groundtruth from atomic knowledge."
-  default_prompt: "Generate question and groundtruth_knowledge_ids pairs from an atomic knowledge JSON file."
+  short_description: "Create grounded financial QA evaluation JSON."
+  default_prompt: "Use $generate-knowledge-qa to create a financial QA evaluation JSON file, preserving its schema and checking question, answer, and fixed-id alignment."

@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""Export rewrite prompts or merge LLM rewrites into a final QA dataset."""
+"""Export rewrite/review prompts, then merge reviewed cases into the fixed JSON schema."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from evidence_alignment import alignment_errors, review_errors, review_input_hash, supporting_by_id
+from validate_qa_dataset import CASE_KEYS, TOP_LEVEL_KEYS, nonempty_string, validate_dataset
 
-FINAL_CASE_KEYS = [
-    "query_id",
-    "category",
-    "question",
-    "groundtruth_knowledge_ids",
-    "groundtruth_answer",
-    "design_intent",
-]
-
+FINAL_CASE_KEYS = CASE_KEYS
 SUCCESS_KEYS = {"question", "category", "design_intent", "groundtruth_answer"}
 
 
@@ -59,8 +52,8 @@ def write_jsonl(rows: list[dict[str, Any]], path: Path) -> None:
             handle.write("\n")
 
 
-def prompt_template() -> str:
-    prompt_path = Path(__file__).resolve().parents[1] / "references" / "rewrite_prompt.md"
+def prompt_template(name: str = "rewrite_prompt.md") -> str:
+    prompt_path = Path(__file__).resolve().parents[1] / "references" / name
     text = prompt_path.read_text(encoding="utf-8")
     if "```text" in text:
         text = text.split("```text", 1)[1].split("```", 1)[0].strip()
@@ -68,15 +61,38 @@ def prompt_template() -> str:
 
 
 def render_prompt(case: dict[str, Any], template: str) -> str:
+    supporting_by_id(case)
     supporting = json.dumps(case.get("supporting_knowledge", []), ensure_ascii=False, indent=2)
     local_topic = str(case.get("category", "局部主题"))
-    return template.replace("{local_topic}", local_topic).replace("{supporting_knowledge}", supporting)
+    return (template.replace("{query_id_json}", json.dumps(case["query_id"], ensure_ascii=False))
+            .replace("{local_topic}", local_topic).replace("{supporting_knowledge}", supporting))
+
+
+def candidate_cases(candidates: Any) -> list[dict[str, Any]]:
+    if not isinstance(candidates, dict) or set(candidates) != set(TOP_LEVEL_KEYS):
+        raise ValueError(f"candidate dataset fields must be exactly {TOP_LEVEL_KEYS}")
+    cases = candidates.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("candidate dataset must contain a non-empty cases list")
+    seen: set[str] = set()
+    for case in cases:
+        if not isinstance(case, dict) or not nonempty_string(case.get("query_id")):
+            raise ValueError("each candidate must have a non-empty string query_id")
+        query_id = case["query_id"]
+        if query_id in seen:
+            raise ValueError(f"duplicate candidate query_id: {query_id}")
+        seen.add(query_id)
+        try:
+            supporting_by_id(case)
+        except ValueError as exc:
+            raise ValueError(f"{query_id}: {exc}") from exc
+    return cases
 
 
 def export_prompts(candidates: dict[str, Any]) -> list[dict[str, Any]]:
     template = prompt_template()
     rows: list[dict[str, Any]] = []
-    for case in candidates.get("cases", []):
+    for case in candidate_cases(candidates):
         rows.append(
             {
                 "query_id": case["query_id"],
@@ -94,28 +110,41 @@ def unwrap_rewrite(row: dict[str, Any]) -> dict[str, Any]:
         value = row.get(key)
         if isinstance(value, dict):
             merged = dict(value)
-            merged.setdefault("query_id", row.get("query_id"))
-            return merged
-        if isinstance(value, str):
+        elif isinstance(value, str):
             try:
-                parsed = json.loads(value)
+                merged = json.loads(value)
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict):
-                parsed.setdefault("query_id", row.get("query_id"))
-                return parsed
+            if not isinstance(merged, dict):
+                continue
+        else:
+            continue
+        for envelope_key in ("query_id", "input_hash"):
+            if envelope_key in row:
+                if envelope_key in merged and merged[envelope_key] != row[envelope_key]:
+                    raise ValueError(f"conflicting wrapper and nested {envelope_key}")
+                merged[envelope_key] = row[envelope_key]
+        return merged
     return row
 
 
-def normalize_rewrites(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def normalize_rewrites(rows: list[dict[str, Any]], label: str = "rewritten_results") -> dict[str, dict[str, Any]]:
     rewrites: dict[str, dict[str, Any]] = {}
     for idx, row in enumerate(rows, start=1):
         rewrite = unwrap_rewrite(row)
         query_id = rewrite.get("query_id")
-        if not query_id:
-            raise SystemExit(f"rewritten_results line {idx}: missing query_id")
-        rewrites[str(query_id)] = rewrite
+        if not nonempty_string(query_id):
+            raise ValueError(f"{label} line {idx}: missing string query_id")
+        if query_id in rewrites:
+            raise ValueError(f"{label}: duplicate query_id {query_id}")
+        rewrites[query_id] = rewrite
     return rewrites
+
+
+def require_complete(results: dict[str, Any], expected: set[str], label: str) -> None:
+    missing, unknown = sorted(expected - set(results)), sorted(set(results) - expected)
+    if missing or unknown:
+        raise ValueError(f"{label}: missing query_ids={missing}; unknown query_ids={unknown}")
 
 
 def final_case_from_rewrite(
@@ -123,56 +152,92 @@ def final_case_from_rewrite(
     candidate: dict[str, Any],
     rewrite: dict[str, Any],
 ) -> dict[str, Any]:
-    missing = [key for key in SUCCESS_KEYS if not rewrite.get(key)]
+    missing = [key for key in SUCCESS_KEYS if not nonempty_string(rewrite.get(key))]
     if missing:
-        raise SystemExit(f"{candidate['query_id']}: missing rewritten fields: {', '.join(sorted(missing))}")
+        raise ValueError(f"missing non-empty rewritten fields: {', '.join(sorted(missing))}")
 
     rewritten_ids = rewrite.get("groundtruth_knowledge_ids")
     original_ids = candidate.get("groundtruth_knowledge_ids", [])
-    if rewritten_ids is not None and list(rewritten_ids) != list(original_ids):
-        print(
-            f"{candidate['query_id']}: rewritten groundtruth_knowledge_ids ignored; preserving candidate ids",
-            file=sys.stderr,
-        )
+    if rewritten_ids is not None and rewritten_ids != original_ids:
+        raise ValueError("rewritten groundtruth_knowledge_ids differ from the fixed candidate ids")
 
     return {
         "query_id": new_query_id,
         "category": rewrite["category"],
         "question": rewrite["question"],
-        "groundtruth_knowledge_ids": original_ids,
+        "groundtruth_knowledge_ids": list(original_ids),
         "groundtruth_answer": rewrite["groundtruth_answer"],
         "design_intent": rewrite["design_intent"],
     }
 
 
-def merge_rewrites(
+def prepare_rewrites(
     candidates: dict[str, Any],
     rewritten_rows: list[dict[str, Any]],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], list[dict[str, Any]]]:
+    cases = candidate_cases(candidates)
     rewrites = normalize_rewrites(rewritten_rows)
-    final_cases: list[dict[str, Any]] = []
+    require_complete(rewrites, {case["query_id"] for case in cases}, "rewritten_results")
+    eligible = []
     rejected_cases: list[dict[str, Any]] = []
+    for candidate in cases:
+        rewrite = rewrites[candidate["query_id"]]
+        reason = rewrite.get("reject_reason")
+        if reason is not None and not nonempty_string(reason):
+            raise ValueError(f"{candidate['query_id']}: reject_reason must be a non-empty string")
+        if reason is None:
+            try:
+                case = final_case_from_rewrite("Q001", candidate, rewrite)
+                errors = validate_dataset({**candidates, "cases": [case]})
+                if not errors:
+                    errors = alignment_errors(candidate, rewrite)
+            except ValueError as exc:
+                errors = [str(exc)]
+            reason = "; ".join(errors) if errors else None
+        if reason:
+            rejected_cases.append({"query_id": candidate["query_id"],
+                                   "groundtruth_knowledge_ids": candidate["groundtruth_knowledge_ids"],
+                                   "reject_reason": reason})
+        else:
+            eligible.append((candidate, rewrite))
+    return eligible, rejected_cases
 
-    for candidate in candidates.get("cases", []):
-        original_query_id = candidate.get("query_id")
-        rewrite = rewrites.get(str(original_query_id))
-        if not rewrite:
-            rejected_cases.append(
-                {
-                    "query_id": original_query_id,
-                    "groundtruth_knowledge_ids": candidate.get("groundtruth_knowledge_ids", []),
-                    "reject_reason": "missing rewritten result",
-                }
-            )
-            continue
-        if rewrite.get("reject_reason"):
-            rejected_cases.append(
-                {
-                    "query_id": original_query_id,
-                    "groundtruth_knowledge_ids": candidate.get("groundtruth_knowledge_ids", []),
-                    "reject_reason": rewrite["reject_reason"],
-                }
-            )
+
+def export_review_prompts(
+    candidates: dict[str, Any], rewritten_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    eligible, rejected = prepare_rewrites(candidates, rewritten_rows)
+    template = prompt_template("alignment_review_prompt.md")
+    rows = []
+    for candidate, rewrite in eligible:
+        input_hash = review_input_hash(candidate, rewrite)
+        payload = {"query_id": candidate["query_id"], "input_hash": input_hash,
+                   "groundtruth_knowledge_ids": candidate["groundtruth_knowledge_ids"],
+                   "supporting_knowledge": candidate["supporting_knowledge"],
+                   "proposed_case": final_case_from_rewrite(candidate["query_id"], candidate, rewrite),
+                   "evidence_alignment": rewrite["evidence_alignment"]}
+        prompt = template.replace("{review_payload}", json.dumps(payload, ensure_ascii=False, indent=2))
+        rows.append({"query_id": candidate["query_id"], "input_hash": input_hash, "prompt": prompt})
+    return rows, rejected
+
+
+def merge_rewrites(
+    candidates: dict[str, Any], rewritten_rows: list[dict[str, Any]],
+    reviewed_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    eligible, rejected_cases = prepare_rewrites(candidates, rewritten_rows)
+    reviews = normalize_rewrites(reviewed_rows, "reviewed_results")
+    require_complete(reviews, {candidate["query_id"] for candidate, _ in eligible}, "reviewed_results")
+    final_cases: list[dict[str, Any]] = []
+    for candidate, rewrite in eligible:
+        review = reviews[candidate["query_id"]]
+        if review.get("input_hash") != review_input_hash(candidate, rewrite):
+            raise ValueError(f"{candidate['query_id']}: review input_hash mismatch; review the current materials and rewrite again")
+        errors = review_errors(review)
+        if errors:
+            rejected_cases.append({"query_id": candidate["query_id"],
+                                   "groundtruth_knowledge_ids": candidate["groundtruth_knowledge_ids"],
+                                   "reject_reason": "; ".join(errors)})
             continue
         final_cases.append(
             final_case_from_rewrite(f"Q{len(final_cases) + 1:03d}", candidate, rewrite)
@@ -192,15 +257,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("candidates", type=Path, help="qa_candidates.json from generate_qa_groundtruth.py.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--export-prompts", action="store_true", help="Write rewrite_prompts.jsonl.")
+    mode.add_argument("--export-review-prompts", type=Path, metavar="REWRITTEN_JSONL", help="Check evidence mappings and export a separate alignment-review batch.")
     mode.add_argument("--merge", type=Path, metavar="REWRITTEN_JSONL", help="Merge rewritten_results.jsonl.")
+    parser.add_argument("--reviews", type=Path, help="Required with --merge: alignment review results JSONL.")
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output path.")
     parser.add_argument(
         "--rejected-output",
         type=Path,
         default=None,
-        help="Rejected-case JSON path for --merge; defaults to <output>.rejected_cases.json when needed.",
+        help="Rejected-case report path; defaults to <output>.rejected_cases.json when needed.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if bool(args.merge) != bool(args.reviews):
+        parser.error("--merge requires --reviews; --reviews is only valid with --merge")
+    if args.merge and args.output.suffix.lower() != ".json":
+        parser.error("the final dataset output must be a .json file")
+    input_paths = {path.resolve() for path in (args.candidates, args.merge, args.export_review_prompts, args.reviews) if path}
+    rejected_path = args.rejected_output or args.output.with_suffix(args.output.suffix + ".rejected_cases.json")
+    if args.output.resolve() in input_paths or rejected_path.resolve() in input_paths or rejected_path.resolve() == args.output.resolve():
+        parser.error("output and rejection-report paths must differ from each other and all input files")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -212,16 +288,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote rewrite prompts to {args.output}")
         return 0
 
-    rewritten_rows = read_jsonl(args.merge)
-    final_dataset, rejected_cases = merge_rewrites(candidates, rewritten_rows)
-    write_json(final_dataset, args.output)
+    rewritten_rows = read_jsonl(args.export_review_prompts or args.merge)
+    if args.export_review_prompts:
+        prompts, rejected_cases = export_review_prompts(candidates, rewritten_rows)
+        final_dataset = None
+    else:
+        final_dataset, rejected_cases = merge_rewrites(candidates, rewritten_rows, read_jsonl(args.reviews))
     if rejected_cases:
         rejected_path = args.rejected_output or args.output.with_suffix(args.output.suffix + ".rejected_cases.json")
         write_json({"rejected_cases": rejected_cases}, rejected_path)
         print(f"wrote {len(rejected_cases)} rejected cases to {rejected_path}")
+    if args.export_review_prompts:
+        if not prompts:
+            raise ValueError("no grounded rewrites remain; inspect rejected cases and regenerate")
+        write_jsonl(prompts, args.output)
+        print(f"wrote {len(prompts)} alignment-review prompts to {args.output}")
+        return 0
+    errors = validate_dataset(final_dataset)
+    if errors:
+        raise ValueError("final dataset was not written: " + "; ".join(errors))
+    write_json(final_dataset, args.output)
     print(f"wrote {len(final_dataset['cases'])} final cases to {args.output}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError) as exc:
+        raise SystemExit(str(exc)) from None
