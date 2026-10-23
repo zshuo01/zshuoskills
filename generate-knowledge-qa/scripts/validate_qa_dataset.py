@@ -21,7 +21,6 @@ CASE_KEYS = [
     "design_intent",
 ]
 META_TERMS = ("knowledge_id", "原子知识", "知识库", "根据文本", "根据材料")
-FORBIDDEN_ANYWHERE = ("supporting_knowledge", "quality_checks", "evidence_alignment", "[草稿]")
 CATEGORY_RE = re.compile(r"^[\u4e00-\u9fff]{2,6}-[\u4e00-\u9fff]{2,6}$")
 LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:[-*•]\s+|\d+[.)、](?!\d)|[一二三四五六七八九十]+[、.)])")
 
@@ -31,25 +30,8 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def count_sentences(text: str) -> int:
-    text = text.strip()
-    if not text:
-        return 0
-    return sum(bool(part.strip()) for part in re.split(r"[。！？!?]+", text))
-
-
 def add_error(errors: list[str], path: str, message: str) -> None:
     errors.append(f"{path}: {message}")
-
-
-def contains_forbidden(value: Any, term: str) -> bool:
-    if isinstance(value, str):
-        return term in value
-    if isinstance(value, list):
-        return any(contains_forbidden(item, term) for item in value)
-    if isinstance(value, dict):
-        return any(term in str(key) or contains_forbidden(item, term) for key, item in value.items())
-    return False
 
 
 def nonempty_string(value: Any) -> bool:
@@ -72,10 +54,6 @@ def validate_dataset(data: Any, known_ids: set[str] | None = None) -> list[str]:
     principles = data.get("design_principles")
     if not isinstance(principles, list) or not principles or not all(nonempty_string(item) for item in principles):
         add_error(errors, "design_principles", "must be a non-empty list of non-empty strings")
-
-    for term in FORBIDDEN_ANYWHERE:
-        if contains_forbidden(data, term):
-            add_error(errors, "$", f"must not contain {term}")
 
     cases = data.get("cases")
     if not isinstance(cases, list):
@@ -101,8 +79,8 @@ def validate_dataset(data: Any, known_ids: set[str] | None = None) -> list[str]:
         if not isinstance(ids, list):
             add_error(errors, f"{path}.groundtruth_knowledge_ids", "must be a list")
         else:
-            if not 3 <= len(ids) <= 10:
-                add_error(errors, f"{path}.groundtruth_knowledge_ids", "must contain 3-10 ids")
+            if len(ids) < 3:
+                add_error(errors, f"{path}.groundtruth_knowledge_ids", "must contain at least 3 ids")
             valid_id_types = all(nonempty_string(kid) and kid == kid.strip() for kid in ids)
             if not valid_id_types:
                 add_error(errors, f"{path}.groundtruth_knowledge_ids", "ids must be non-empty strings without outer whitespace")
@@ -128,7 +106,7 @@ def validate_dataset(data: Any, known_ids: set[str] | None = None) -> list[str]:
                     add_error(errors, f"{path}.question", f"must not contain metadata term {term}")
             if isinstance(ids, list):
                 for kid in ids:
-                    if isinstance(kid, str) and re.fullmatch(r"[A-Za-z0-9_-]+", kid):
+                    if isinstance(kid, str) and re.fullmatch(r"[A-Za-z0-9_-]+", kid) and re.search(r"[A-Za-z]", kid):
                         if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(kid)}(?![A-Za-z0-9_-])", question):
                             add_error(errors, f"{path}.question", f"must not expose knowledge id {kid}")
             normalized_question = re.sub(r"\s+", "", question)
@@ -146,8 +124,6 @@ def validate_dataset(data: Any, known_ids: set[str] | None = None) -> list[str]:
         else:
             if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", answer):
                 add_error(errors, f"{path}.groundtruth_answer", "must contain a non-empty answer")
-            if count_sentences(answer) > 3:
-                add_error(errors, f"{path}.groundtruth_answer", "must be at most 3 sentences")
             for term in META_TERMS:
                 if term in answer:
                     add_error(errors, f"{path}.groundtruth_answer", f"must not contain metadata term {term}")
@@ -166,7 +142,7 @@ def validate_dataset(data: Any, known_ids: set[str] | None = None) -> list[str]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path, help="Final dataset JSON to validate.")
-    parser.add_argument("--knowledge-file", type=Path, help="Optional original knowledge JSON/JSONL; verify that every id exists.")
+    parser.add_argument("--knowledge-file", type=Path, nargs="+", help="Original knowledge JSON/JSONL files; verify that every id exists.")
     return parser.parse_args(argv)
 
 
@@ -176,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.knowledge_file:
         from generate_qa_groundtruth import index_records, load_json_or_jsonl
 
-        _, by_id = index_records(load_json_or_jsonl(args.knowledge_file))
+        _, by_id = index_records([row for path in args.knowledge_file for row in load_json_or_jsonl(path)])
         known_ids = set(by_id)
     errors = validate_dataset(load_json(args.dataset), known_ids)
     if errors:

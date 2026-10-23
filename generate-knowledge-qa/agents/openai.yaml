@@ -1,4 +1,4 @@
 interface:
   display_name: "Generate Knowledge QA"
   short_description: "Create grounded financial QA evaluation JSON."
-  default_prompt: "Use $generate-knowledge-qa to create a financial QA evaluation JSON file, preserving its schema and checking question, answer, and fixed-id alignment."
+  default_prompt: "Use $generate-knowledge-qa to create financial QA evaluation JSON with at least 3 relevant supporting knowledge ids per question, preserving the existing schema."

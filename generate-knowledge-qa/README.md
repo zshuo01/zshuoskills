@@ -1,60 +1,31 @@
 # Generate Knowledge QA
 
-Generate Chinese financial GraphRAG local-query evaluation cases whose
-questions, answers, and fixed knowledge ids match. See [SKILL.md](SKILL.md) for
-the full contract and workflow.
+规则与最终 JSON 格式见 [SKILL.md](SKILL.md)。通常直接读取知识、生成问题/答案/至少3个支撑ID，再运行校验器即可。ID数量按实际需要确定，无固定目标或上限；不足3条有效支撑就换题，不凑数。
 
-The final deliverable remains a `.json` file with exactly:
+## 可选批量工具
 
-- Top level: `dataset_name`, `source_file`, `design_principles`, `cases`.
-- Each case: `query_id`, `category`, `question`, `groundtruth_knowledge_ids`,
-  `groundtruth_answer`, `design_intent`.
-
-Review data never enter that file. Each case still uses 3–10 fixed ids and an
-answer of at most three sentences. Graph structure is not an output or review
-requirement.
-
-## Pipeline
-
-Run these commands from the repository root; for an installed copy, replace
-`generate-knowledge-qa` with that skill folder’s path.
+从仓库根目录运行；已安装的 skill 请替换脚本目录：
 
 ```bash
-python generate-knowledge-qa/scripts/generate_qa_groundtruth.py knowledge.json -o qa_candidates_review.json --count 30 --include-review-fields
-python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --export-prompts -o rewrite_prompts.jsonl
+python generate-knowledge-qa/scripts/generate_qa_groundtruth.py knowledge.json -o candidates.json --count 30
+python generate-knowledge-qa/scripts/rewrite_and_merge.py candidates.json --export-prompts -o prompts.jsonl
 ```
 
-Process each rewrite prompt with an LLM and save `rewritten_results.jsonl`.
-Successful results include an intermediate `evidence_alignment`: each id’s
-exact quote, question span, answer span, and necessary contribution. Unsuitable
-sets return `reject_reason`. Then export a fresh review pass:
+使用 LLM 处理每个提示词一次，将六字段用例或带 `query_id` 的 `reject_reason` 存为 `results.jsonl`，然后合并：
 
 ```bash
-python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --export-review-prompts rewritten_results.jsonl -o alignment_review_prompts.jsonl
+python generate-knowledge-qa/scripts/rewrite_and_merge.py candidates.json --merge results.jsonl -o final.json
 ```
 
-Process these prompts and save `reviewed_results.jsonl`, retaining the supplied
-`query_id` and `input_hash`. A review checks question answerability, answer
-support, each id’s necessity, scope/conditions, and numbers. Then merge:
+候选只包含 `query_id`、分类提示和完整支撑文本，不预填最终 ID。默认每个候选池最多12条材料，可用 `--pool-size N` 调整，或用 `--pool-size 0` 包含整个相关分组；这是读取批次大小，不是最终证据数量要求。生成器支持多个输入文件及原有的可选 `--relations` 分组。
+
+合并采用模型选出的真实 ID 子集，自动检查原有四个顶层字段、六个用例字段、ID存在性、唯一性和至少3条。不需要片段映射、哈希或第二轮复核。语义是否对应在生成时自检；程序不声称能自动证明答案正确。
+
+无效项打印原因，可选 `--rejected-output rejected.json` 保存报告。缺失/重复结果会报错；没有有效用例时不写最终文件。失败时已有输出保持原样。
+
+直接生成最终文件后，可检查一个或多个原始知识文件：
 
 ```bash
-python generate-knowledge-qa/scripts/rewrite_and_merge.py qa_candidates_review.json --merge rewritten_results.jsonl --reviews reviewed_results.jsonl -o graphrag_local_eval_final.json
-python generate-knowledge-qa/scripts/validate_qa_dataset.py graphrag_local_eval_final.json --knowledge-file knowledge.json
-```
-
-Source texts are complete by default. Missing/truncated supports, changed fixed
-ids, fabricated quotes, unmapped answer text, and missing/duplicate batch
-results are blocked. Direct numbers absent from their citations require an
-explicit calculation derivation and subsequent review. Invalid rewrites and
-rejected reviews are reported separately; a failed or empty final dataset is
-not written. If an output already exists, failure leaves it untouched; use a
-new output path for a new run to avoid confusing it with an earlier dataset.
-
-These checks establish traceability; semantic correctness still depends on the
-actual review and a human spot-check. They do not claim to prove entailment.
-
-Run the regression tests with:
-
-```bash
+python generate-knowledge-qa/scripts/validate_qa_dataset.py final.json --knowledge-file knowledge.json
 python -B -m unittest discover -s generate-knowledge-qa/tests -v
 ```

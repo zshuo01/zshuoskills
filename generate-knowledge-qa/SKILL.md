@@ -1,130 +1,41 @@
 ---
 name: generate-knowledge-qa
-description: 'Generate Chinese financial GraphRAG local-query evaluation datasets from atomic knowledge JSON/JSONL. Select fixed knowledge ids, write questions and grounded answers, check each id’s necessary contribution, and review alignment before producing the established JSON dataset schema.'
+description: Generate Chinese financial GraphRAG evaluation JSON from atomic knowledge JSON/JSONL, matching each question and answer to at least three relevant supporting knowledge ids.
 ---
 
 # Generate Knowledge QA
 
-Generate questions that match both their `groundtruth_knowledge_ids` and
-`groundtruth_answer`. Same-topic knowledge alone is insufficient: every listed
-id must contribute information needed to answer the actual question.
+从金融知识生成评测集，重点是问题、答案、支撑 ID 合理对应。直接完成出题与自检，不要求额外的证据映射、复核批次或审计文件。
 
-## Final output contract
+## 最终格式
 
-The deliverable is a **JSON file containing one object**, never JSONL, a bare
-array, or a prose-only response. Keep the existing schema exactly:
+最终交付一个 `.json` 文件，根节点为对象，字段与顺序保持不变：
 
-```json
-{
-  "dataset_name": "graphrag_local_retrieval_eval_1",
-  "source_file": "knowledge.json",
-  "design_principles": ["固定知识集合应充分支撑问题和答案，每个知识点都有必要贡献。"],
-  "cases": [
-    {
-      "query_id": "Q001",
-      "category": "理财业务-申请办理",
-      "question": "申购星河产品需要具备什么资格、提交哪些材料，并在什么时间内申请？",
-      "groundtruth_knowledge_ids": ["K001", "K002", "K003"],
-      "groundtruth_answer": "申购人须为已完成风险测评的个人客户。申请人须提交有效身份证明，且须在交易日15:00前提交申请。",
-      "design_intent": "测试系统能否围绕产品申购召回客户资格、申请材料和办理时间。"
-    }
-  ]
-}
-```
+- 顶层：`dataset_name`、`source_file`、`design_principles`、`cases`。
+- 每条 case：`query_id`、`category`、`question`、`groundtruth_knowledge_ids`、`groundtruth_answer`、`design_intent`。
+- 名称和来源为字符串，设计原则为字符串数组，`cases` 为非空数组；问题按 `Q001`、`Q002` 连续编号。
 
-The product and rules above are fictional examples. Actual answers must come
-from the supplied knowledge. The only top-level fields are `dataset_name`,
-`source_file`, `design_principles`, `cases`; the only case fields are the six
-shown above, written in that order. Never add evidence, review, hash, score, or
-graph fields to the final file. Intermediate JSON/JSONL may contain review data.
+不添加额外字段，不把中间候选文件或 JSONL 当作最终交付。
 
-## Invariants
+## 出题规则
 
-- Python selects ids/materials; the LLM writes natural questions and answers.
-- Each case has 3–10 unique ids. Fix ids before rewrite; do not add, drop,
-  replace, or reorder them. Reject unsuitable combinations rather than forcing
-  a question or silently changing the ids.
-- The fixed set must suffice to answer every part of the question. Each id
-  must contribute a necessary fact; duplicates and related background are not
-  valid filler. Test necessity by considering removal of each id.
-- Answers directly and completely answer the question in at most 3 Chinese
-  prose sentences. Preserve conditions, exceptions, negation, dates, scope,
-  numbers, and units. Avoid generic answers such as “以相关规定为准”.
-- Use only supplied knowledge and explicit question premises. Any calculation
-  must identify its inputs and derivation and be independently rechecked.
-- `category` is `主题-子主题`, each part 2–6 Chinese characters. `question`
-  contains exactly one `？`, no `?`, knowledge ids, or metadata wording such as
-  `原子知识`, `知识库`, `根据文本`, `根据材料`.
-- `design_intent` starts with `测试系统能否召回` or `测试系统能否围绕` and identifies
-  the information being tested. The answer contains no metadata or bullet list.
-- Candidate selection remains offline and model-free by default. A relation
-  file is an optional grouping input; there is no graph-structure requirement.
+1. 每题至少 **3 个真实、唯一且有实际贡献的知识 ID**。不设目标数量或固定上限；需要多少就选多少，不默认全为3个，也不强求数量分布多样。
+2. 围绕自然、明确的业务问题选知识。候选知识只是资料池，可以舍弃无关或重复内容；不能为了凑够3条拼接不相干的问题。若无法自然组成至少3条有效支撑，换题或拒绝。
+3. 所选知识应完整支撑问题和答案，每个 ID 都对回答有实际贡献。问题要求“全部材料、所有条件”等完整清单时，核对原文范围，不能只挑部分条目作完整答案。
+4. 答案简洁、具体、完整，保留主体、适用条件、否定、例外、时间、数值和单位，不补充外部规则，不以“以相关规定为准”代替答案。计算应使用材料中的事实并核对结果；不设句数硬限制。
+5. 问题为自然中文，恰好一个 `？`，无半角 `?`、知识 ID 或“原子知识、知识库、根据文本、根据材料”等措辞。答案使用连续中文表述，不列要点。
+6. `category` 为“主题-子主题”，两段各2–6个汉字；`design_intent` 以“测试系统能否召回”或“测试系统能否围绕”开头，简要说明考查的信息。
 
-## Workflow
+## 执行
 
-Commands below use `<skill-dir>` to mean the folder containing this SKILL.md;
-resolve it to the actual installed or repository path before running.
-
-1. Inspect input. Supported ids: `knowledge_id`/`id`/`kid`; text:
-   `knowledge_text`/`content`/`text`/`chunk`/`summary`. Duplicate ids and missing
-   text are errors. Identify whether time, jurisdiction, or version conditions
-   are present; do not discard them when writing questions.
-2. Generate review candidates with full supporting texts:
+1. 读取用户的知识及来源。识别 ID 字段 `knowledge_id`/`id`/`kid` 和正文 `knowledge_text`/`content`/`text`/`chunk`/`summary`，保留适用条件；重复 ID 或缺正文应先处理。
+2. 生成自然问题，同时选择支撑 ID、撰写答案。输出前自检：问题是否答全、每个 ID 是否有用、答案是否忠于原文。证据不足则回看原始知识补齐或换题，不凑数。
+3. 保存最终 JSON 并校验。`<skill-dir>` 表示本文件所在目录，执行时替换为实际路径：
 
    ```bash
-   python <skill-dir>/scripts/generate_qa_groundtruth.py knowledge.json -o qa_candidates_review.json --count 30 --include-review-fields
+   python <skill-dir>/scripts/validate_qa_dataset.py final.json --knowledge-file knowledge.json
    ```
 
-   Optional `--relations relations.json` assists grouping as before. Defaults
-   remain min/target/max ids 3/6/10 and at most two candidates per provisional
-   category. `--count` is an upper bound, not a guaranteed final count.
-   `--max-supporting-chars 0` (default) keeps full text; truncated review
-   materials cannot enter rewrite. Question, answer, and intent are blank
-   candidate fields, not a finished dataset. Compact candidates without
-   `--include-review-fields` cannot be used for rewrite.
-3. Export prompts, then process every row using the LLM. Follow
-   [rewrite_prompt.md](references/rewrite_prompt.md): success includes an
-   intermediate `evidence_alignment` linking each fixed id to an exact source
-   quote, a question span, an answer span, and its necessary contribution.
-   Return a concrete `reject_reason` when the set cannot support a valid case.
+   多个输入可写为 `--knowledge-file json1.json json2.json`。校验器检查结构、ID存在性和至少3条的要求；语义对应由出题时自检负责。
 
-   ```bash
-   python <skill-dir>/scripts/rewrite_and_merge.py qa_candidates_review.json --export-prompts -o rewrite_prompts.jsonl
-   ```
-
-   Save one result per candidate in `rewritten_results.jsonl`, preserving
-   `query_id`. No missing, duplicate, or unknown ids are accepted.
-4. Export a separate review batch:
-
-   ```bash
-   python <skill-dir>/scripts/rewrite_and_merge.py qa_candidates_review.json --export-review-prompts rewritten_results.jsonl -o alignment_review_prompts.jsonl
-   ```
-
-   This checks actual quotes, coverage of all ids and the full answer, fixed-id
-   integrity, and uncited direct numbers. A `derivation` explains a calculation;
-   it is not proof that the calculation is correct.
-5. Process the review prompts as a fresh review pass using
-   [alignment_review_prompt.md](references/alignment_review_prompt.md). Re-read
-   the original knowledge rather than accepting the writer’s explanation.
-   Check answerability, answer support, necessity of every id, scope, and
-   numerical correctness. Copy `query_id` and `input_hash` into
-   `reviewed_results.jsonl`. Do not fabricate review approvals or hashes;
-   changing any material, wording, or evidence mapping requires a new review.
-6. Merge only reviewed, accepted cases into the final JSON:
-
-   ```bash
-   python <skill-dir>/scripts/rewrite_and_merge.py qa_candidates_review.json --merge rewritten_results.jsonl --reviews reviewed_results.jsonl -o graphrag_local_eval_final.json
-   python <skill-dir>/scripts/validate_qa_dataset.py graphrag_local_eval_final.json --knowledge-file knowledge.json
-   ```
-
-   Merge automatically validates the final schema before writing. Rejected
-   cases go to a separate report; an empty result is an error. Rejection may
-   reduce the count: inspect reasons and regenerate when more cases are needed,
-   without relaxing evidence requirements or padding ids. Final query ids are
-   numbered sequentially as before.
-7. Spot-check complete cases against original knowledge, especially numbers,
-   exceptions, and whether each id is necessary. Open the final file to confirm
-   the four top-level and six case fields, then deliver that JSON file.
-
-Structural validation and exact-quote checks cannot prove semantic entailment.
-The separate review and spot-check are part of producing trustworthy groundtruth.
+数据量大时可使用 [README.md](README.md) 中的可选批量脚本；只需一轮生成，无额外复核环节。候选池缺少所需证据时，回看原始知识并补入实际读取的材料。关系文件仅用于候选分组，无图结构保留要求。

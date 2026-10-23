@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Generate GraphRAG local-query evaluation candidates from atomic knowledge.
-
-The script is deliberately model-free by default. It fixes a 3-10 id local
-topic cluster first, then emits blank wording fields and supporting text for a
-later rewrite step. The rewrite step must preserve the ids or reject the case.
-"""
+"""Optionally prepare related knowledge pools; the LLM selects the final ids."""
 
 from __future__ import annotations
 
@@ -30,9 +25,7 @@ RELATION_PAIR_KEYS = (
 )
 
 DEFAULT_MIN_IDS = 3
-DEFAULT_TARGET_IDS = 6
-DEFAULT_MAX_IDS = 10
-DEFAULT_MAX_SUPPORTING_CHARS = 0  # Full source text; bounded previews are separate.
+DEFAULT_POOL_SIZE = 12
 
 TAX_TOPIC_WHITELIST = (
     "增值税",
@@ -126,10 +119,9 @@ FACET_TO_SUBTHEME = {
 }
 
 DEFAULT_PRINCIPLES = [
-    "每个问题围绕同一业务或法规主题组织，需要联合检索多个原子知识才能完整回答。",
-    "groundtruth_knowledge_ids 仅保留回答该问题所必需的知识点。",
-    "问题覆盖申报、征收、退税、抵扣、账户管理、法律责任等不同检索场景。",
-    "问题采用自然中文表达，不在问题中直接暴露答案或 knowledge_id。",
+    "问题、答案与支撑知识相互对应，答案完整保留适用条件和例外。",
+    "每题至少需要3条有实际贡献的知识，数量由问题决定，不凑数或固定为3条。",
+    "问题采用自然中文表达，不暴露知识编号，不为拼接知识而生硬设问。",
 ]
 
 
@@ -238,10 +230,6 @@ def full_normalized_text(record: dict[str, Any]) -> str:
     return normalized_text(record, max_chars=None)
 
 
-def preview_text(text: str, limit: int = 180) -> str:
-    return text if len(text) <= limit else f"{text[:limit].rstrip()}..."
-
-
 def sort_key(kid: str) -> tuple[str, int, str]:
     match = re.search(r"^(.*?)(\d+)$", kid)
     if match:
@@ -281,13 +269,6 @@ def detect_facets_from_text(text: str) -> list[str]:
         if any(keyword in text for keyword in keywords):
             facets.append(label)
     return facets
-
-
-def detect_facets(records: list[dict[str, Any]]) -> list[str]:
-    counts: Counter[str] = Counter()
-    for record in records:
-        counts.update(detect_facets_from_text(normalized_text(record)))
-    return [facet for facet, _ in counts.most_common()]
 
 
 def canonical_topic(topic: str) -> str:
@@ -372,20 +353,6 @@ def build_category(main_topic: str, subtheme: str) -> str:
     main = canonical_topic(main_topic)
     sub = canonical_topic(subtheme)
     return f"{main}-{sub}"
-
-
-def build_question(main_topic: str, subtheme: str, facets: list[str]) -> str:
-    """Do not synthesize natural questions in Python.
-
-    The generator's job is to choose a coherent fixed id cluster. Natural
-    wording belongs to the LLM rewrite step, which sees the fixed ids and their
-    supporting text.
-    """
-    return ""
-
-
-def build_design_intent(main_topic: str, subtheme: str, facets: list[str]) -> str:
-    return ""
 
 
 def extract_relation_edges(rows: list[Any], valid_ids: set[str]) -> set[tuple[str, str]]:
@@ -568,53 +535,27 @@ def dedupe_clusters(
 def make_supporting_knowledge(
     kid: str,
     record: dict[str, Any],
-    max_supporting_chars: int,
 ) -> dict[str, Any]:
-    full_text = full_normalized_text(record)
-    support_text = full_text[:max_supporting_chars] if max_supporting_chars else full_text
     return {
         "knowledge_id": kid,
-        "knowledge_text": support_text,
-        "preview_text": preview_text(full_text),
-        "detected_facets": detect_facets_from_text(full_text),
-        "text_length": len(full_text),
-        "is_truncated": len(support_text) < len(full_text),
+        "knowledge_text": full_normalized_text(record),
     }
 
 
-def make_case(
+def make_candidate(
     query_id: str,
     ids: list[str],
     by_id: dict[str, dict[str, Any]],
-    final_only: bool,
-    max_supporting_chars: int = DEFAULT_MAX_SUPPORTING_CHARS,
-    scores: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     ids = [kid for kid in ids if kid in by_id]
     records = [by_id[kid] for kid in ids]
     main_topic = infer_main_topic(records)
     subtheme = infer_subtheme(records)
-    facets = detect_facets(records)
-
-    case: dict[str, Any] = {
+    return {
         "query_id": query_id,
         "category": build_category(main_topic, subtheme),
-        "question": build_question(main_topic, subtheme, facets),
-        "groundtruth_knowledge_ids": ids,
-        "groundtruth_answer": "",
-        "design_intent": build_design_intent(main_topic, subtheme, facets),
+        "supporting_knowledge": [make_supporting_knowledge(kid, by_id[kid]) for kid in ids],
     }
-    if not final_only:
-        case["supporting_knowledge"] = [
-            make_supporting_knowledge(kid, by_id[kid], max_supporting_chars)
-            for kid in ids
-        ]
-        case["quality_checks"] = {
-            "groundtruth_count": len(ids),
-            "detected_facets": facets,
-            **(scores or score_cluster(ids, by_id)),
-        }
-    return case
 
 
 def write_dataset(dataset: dict[str, Any], path: Path) -> None:
@@ -624,11 +565,6 @@ def write_dataset(dataset: dict[str, Any], path: Path) -> None:
         handle.write("\n")
 
 
-def validate_id_args(min_ids: int, target_ids: int, max_ids: int) -> None:
-    if not (3 <= min_ids <= target_ids <= max_ids <= 10):
-        raise SystemExit("--min-ids/--target-ids/--max-ids must satisfy 3 <= min <= target <= max <= 10")
-
-
 def build_candidates(
     records: list[dict[str, Any]],
     by_id: dict[str, dict[str, Any]],
@@ -636,25 +572,26 @@ def build_candidates(
 ) -> list[dict[str, Any]]:
     valid_ids = set(by_id)
     raw_groups: list[tuple[str, list[str]]] = []
+    pool_size = args.pool_size or len(by_id)
 
-    if args.relations and args.relations.exists():
+    if args.relations:
         relation_rows = load_json_or_jsonl(args.relations)
         edges = extract_relation_edges(relation_rows, valid_ids)
         raw_groups.extend(
             ("relation", group)
-            for group in relation_groups(edges, args.min_ids, args.target_ids, args.max_ids)
+            for group in relation_groups(edges, DEFAULT_MIN_IDS, pool_size, pool_size)
         )
 
     raw_groups.extend(
         ("bucket", group)
-        for group in bucket_groups(records, by_id, args.min_ids, args.target_ids, args.max_ids)
+        for group in bucket_groups(records, by_id, DEFAULT_MIN_IDS, pool_size, pool_size)
     )
 
     scored_clusters: list[dict[str, Any]] = []
     seen_exact: set[tuple[str, ...]] = set()
     for origin, group in raw_groups:
         ids = sorted([kid for kid in dict.fromkeys(group) if kid in valid_ids], key=sort_key)
-        if not (args.min_ids <= len(ids) <= args.max_ids):
+        if len(ids) < DEFAULT_MIN_IDS:
             continue
         key = tuple(ids)
         if key in seen_exact:
@@ -674,17 +611,7 @@ def build_candidates(
         if args.max_per_category and category_counts[category] >= args.max_per_category:
             continue
         query_id = f"Q{len(cases) + 1:03d}"
-        case = make_case(
-            query_id,
-            cluster["ids"],
-            by_id,
-            final_only=args.final_only,
-            max_supporting_chars=args.max_supporting_chars,
-            scores=cluster["scores"],
-        )
-        if not args.final_only:
-            case["quality_checks"]["cluster_origin"] = cluster["origin"]
-        cases.append(case)
+        cases.append(make_candidate(query_id, cluster["ids"], by_id))
         category_counts[category] += 1
         if len(cases) >= args.count:
             break
@@ -693,50 +620,38 @@ def build_candidates(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("knowledge_file", type=Path, help="Atomic knowledge JSON or JSONL file.")
+    parser.add_argument("knowledge_file", type=Path, nargs="+", help="Atomic knowledge JSON/JSONL files.")
     parser.add_argument("--relations", type=Path, help="Optional relation JSON/JSONL file linking knowledge ids.")
     parser.add_argument("-o", "--output", type=Path, default=Path("qa_candidates.json"), help="Output candidate JSON.")
     parser.add_argument("--count", type=int, default=30, help="Maximum number of cases to emit.")
-    parser.add_argument("--min-ids", type=int, default=DEFAULT_MIN_IDS, help="Minimum ids per case; must be >= 3.")
-    parser.add_argument("--target-ids", type=int, default=DEFAULT_TARGET_IDS, help="Preferred ids per case.")
-    parser.add_argument("--max-ids", type=int, default=DEFAULT_MAX_IDS, help="Maximum ids per case; must be <= 10.")
+    parser.add_argument("--pool-size", type=int, default=DEFAULT_POOL_SIZE, help="Materials per candidate pool, not a final-id target or cap; 0 includes the whole related group.")
     parser.add_argument("--dataset-name", default=None, help="dataset_name field; defaults to graphrag_local_retrieval_eval_<N>.")
     parser.add_argument("--source-file", default=None, help="source_file field; defaults to the input file name.")
-    parser.add_argument(
-        "--include-review-fields",
-        action="store_true",
-        help="Include supporting_knowledge and quality_checks for rewrite/review; final JSON should omit them.",
-    )
-    parser.add_argument("--final-only", action="store_true", help="Deprecated compatibility flag; this is now the default.")
-    parser.add_argument("--max-supporting-chars", type=int, default=DEFAULT_MAX_SUPPORTING_CHARS, help="Max chars per supporting text; 0 (default) keeps the full text. Truncated candidates cannot be rewritten.")
     parser.add_argument("--min-coherence", type=float, default=0.12, help="Minimum final_coherence_score for output clusters.")
     parser.add_argument("--overlap-threshold", type=float, default=0.75, help="Jaccard id-overlap threshold for candidate dedupe.")
     parser.add_argument("--max-per-category", type=int, default=2, help="At most N cases per category; 0 disables the cap.")
-    parser.add_argument("--allow-nonexclusive-topic", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args(argv)
-    args.final_only = (not args.include_review_fields) or args.final_only
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    validate_id_args(args.min_ids, args.target_ids, args.max_ids)
+    if args.pool_size != 0 and args.pool_size < DEFAULT_MIN_IDS:
+        raise SystemExit("--pool-size must be 0 or at least 3")
     if args.count < 1:
         raise SystemExit("--count must be positive")
-    if args.max_supporting_chars != 0 and args.max_supporting_chars < 500:
-        raise SystemExit("--max-supporting-chars must be 0 (full text) or at least 500")
-
-    raw_records = load_json_or_jsonl(args.knowledge_file)
+    raw_records = [row for path in args.knowledge_file for row in load_json_or_jsonl(path)]
     records, by_id = index_records(raw_records)
-    if len(by_id) < args.min_ids:
-        raise SystemExit(f"Need at least {args.min_ids} records with knowledge_id/id/kid")
+    if len(by_id) < DEFAULT_MIN_IDS:
+        raise SystemExit("Need at least 3 knowledge records")
+    if args.output.resolve() in {path.resolve() for path in args.knowledge_file}:
+        raise SystemExit("output must differ from the input knowledge files")
 
     cases = build_candidates(records, by_id, args)
     if not cases:
         raise SystemExit("No candidate clusters met the filters; no empty dataset was written")
     dataset = {
         "dataset_name": args.dataset_name or f"graphrag_local_retrieval_eval_{len(cases)}",
-        "source_file": args.source_file or args.knowledge_file.name,
+        "source_file": args.source_file or ", ".join(path.name for path in args.knowledge_file),
         "design_principles": DEFAULT_PRINCIPLES,
         "cases": cases,
     }
